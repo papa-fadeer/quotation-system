@@ -1,0 +1,321 @@
+import { useState, useEffect, useMemo } from 'react';
+import { 
+  Trash2, 
+  Printer, 
+  FileText, 
+  PlusCircle, 
+  CheckSquare, 
+  Square, 
+  Save, 
+  History, 
+  Loader2, 
+  X 
+} from 'lucide-react';
+
+// Firebase Imports
+import { initializeApp } from 'firebase/app';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  onSnapshot, 
+  addDoc, 
+  serverTimestamp, 
+  deleteDoc,
+  DocumentData
+} from 'firebase/firestore';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  onAuthStateChanged,
+  User
+} from 'firebase/auth';
+
+// --- วาง Firebase Config ของคุณตรงนี้ ---
+const firebaseConfig = {
+  apiKey: "AIzaSyCvlcp3MFfjtDu-8o2Rs1in8P-XD-Vj7ec",
+  authDomain: "driver-admin-system.firebaseapp.com",
+  projectId: "driver-admin-system",
+  storageBucket: "driver-admin-system.firebasestorage.app",
+  messagingSenderId: "367025349092",
+  appId: "1:367025349092:web:fd60f4dce0f9548da767f1"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = 'my-quotation-app';
+
+// --- Types ---
+interface QuotationItem {
+  id: number;
+  description: string;
+  quantity: number;
+  unit: string;
+  unitPrice: number;
+}
+
+// --- Utility: Thai Baht Text ---
+const thaiBahtText = (num: number): string => {
+  if (!num || isNaN(num)) return "(-)";
+  const minus = num < 0 ? "ลบ" : "";
+  const formattedNum = Math.abs(num).toFixed(2);
+  const [intPart, decimalPart] = formattedNum.split(".");
+  const thaiNums = ["ศูนย์", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า"];
+  const units = ["", "สิบ", "ร้อย", "พัน", "หมื่น", "แสน", "ล้าน"];
+  
+  const convert = (s: string) => {
+    let res = "";
+    for (let i = 0; i < s.length; i++) {
+      let n = parseInt(s[i]);
+      if (n !== 0) {
+        if (i === s.length - 1 && n === 1 && s.length > 1) res += "เอ็ด";
+        else if (i === s.length - 2 && n === 2) res += "ยี่สิบ";
+        else if (i === s.length - 2 && n === 1) res += "สิบ";
+        else res += thaiNums[n] + units[s.length - 1 - i];
+      }
+    }
+    return res;
+  };
+
+  let result = minus;
+  if (parseInt(intPart) === 0) result += "ศูนย์";
+  else {
+    const segments = [];
+    let sInt = intPart;
+    while (sInt.length > 6) {
+      segments.push(sInt.slice(-6));
+      sInt = sInt.slice(0, -6);
+    }
+    segments.push(sInt);
+    for (let i = segments.length - 1; i >= 0; i--) {
+      result += convert(segments[i]) + (i > 0 ? "ล้าน" : "");
+    }
+  }
+  result += "บาท";
+  if (parseInt(decimalPart) === 0) result += "ถ้วน";
+  else result += convert(decimalPart) + "สตางค์";
+  return `(${result})`;
+};
+
+const App = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const [savedQuotes, setSavedQuotes] = useState<DocumentData[]>([]);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+
+  const [companyInfo, setCompanyInfo] = useState({
+    name: 'บริษัท ยั่งยืน เทคโนโลยี เซอร์วิส แอนด์ ซัพพลาย จำกัด',
+    address: '541 หมู่ที่ 3 ตำบลจันดี อำเภอฉวาง จังหวัดนครศรีธรรมราช 80250',
+    taxId: '0805565003663',
+    phone: '093-2874544',
+  });
+
+  const [clientInfo, setClientInfo] = useState({
+    name: '',
+    address: '',
+    taxId: '',
+    isHeadOffice: true,
+    ref: ''
+  });
+
+  const [metaInfo, setMetaInfo] = useState({
+    quoteNumber: `QT${new Date().getFullYear().toString().slice(-2)}-001`,
+    date: new Date().toISOString().split('T')[0],
+    validDays: 30,
+    paymentTerm: 'เงินสด',
+    salesPerson: 'M-001'
+  });
+
+  const [items, setItems] = useState<QuotationItem[]>([
+    { id: 1, description: '', quantity: 1, unit: 'ชุด', unitPrice: 0 },
+  ]);
+
+  const [vatRate, setVatRate] = useState(7);
+  const [discount, setDiscount] = useState(0);
+
+  useEffect(() => {
+    signInAnonymously(auth).catch(console.error);
+    return onAuthStateChanged(auth, setUser);
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    setIsLoadingHistory(true);
+    const q = collection(db, 'artifacts', appId, 'users', user.uid, 'quotations');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const quotes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setSavedQuotes(quotes.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
+      setIsLoadingHistory(false);
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  const totals = useMemo(() => {
+    const subtotal = items.reduce((acc, item) => acc + (item.quantity * item.unitPrice), 0);
+    const afterDiscount = subtotal - discount;
+    const vatAmount = (afterDiscount * vatRate) / 100;
+    const grandTotal = afterDiscount + vatAmount;
+    return { subtotal, afterDiscount, vatAmount, grandTotal };
+  }, [items, vatRate, discount]);
+
+  const handleItemChange = (id: number, field: keyof QuotationItem, value: string | number) => {
+    setItems(items.map(item => item.id === id ? { ...item, [field]: value } : item));
+  };
+
+  const handleAddItem = () => {
+    setItems([...items, { id: Date.now(), description: '', quantity: 1, unit: 'ชุด', unitPrice: 0 }]);
+  };
+
+  const handleRemoveItem = (id: number) => {
+    if (items.length > 1) setItems(items.filter(i => i.id !== id));
+  };
+
+  const handleSaveToCloud = async () => {
+    if (!user) return;
+    setIsSaving(true);
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'quotations'), {
+        companyInfo, clientInfo, metaInfo, items, vatRate, discount, totals,
+        createdAt: serverTimestamp(),
+      });
+      setIsSaving(false);
+    } catch (error) {
+      console.error(error);
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100 py-10 px-4 print:bg-white print:p-0 flex flex-col items-center">
+      <div className="max-w-5xl w-full mb-6 flex justify-between items-center print:hidden bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+        <div className="flex items-center gap-3">
+          <div className="bg-blue-600 p-2 rounded-lg text-white"><FileText size={24} /></div>
+          <div>
+            <h1 className="text-lg font-bold text-slate-800">Quotation System</h1>
+            <p className="text-xs text-slate-400">User: {user?.uid.slice(0, 8)}</p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => setIsHistoryOpen(true)} className="flex items-center gap-2 px-4 py-2 text-slate-600 hover:bg-slate-50 rounded-lg border border-slate-200 font-medium">
+            <History size={18} /> ประวัติ
+          </button>
+          <button onClick={handleSaveToCloud} disabled={isSaving} className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white hover:bg-green-700 rounded-lg font-medium disabled:opacity-50">
+            {isSaving ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />} บันทึก
+          </button>
+          <button onClick={() => window.print()} className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white hover:bg-blue-700 rounded-lg font-medium">
+            <Printer size={18} /> พิมพ์
+          </button>
+        </div>
+      </div>
+
+      <div className="max-w-4xl w-full bg-white p-10 shadow-2xl border-t-[10px] border-blue-900 relative print:shadow-none print:p-4">
+        <div className="flex justify-between items-start mb-8">
+          <div className="flex gap-5">
+            <div className="w-20 h-20 border-[3px] border-blue-900 rounded-full flex items-center justify-center text-blue-900 font-black text-2xl">YYT</div>
+            <div className="space-y-1">
+              <input className="text-xl font-bold w-full outline-none" value={companyInfo.name} onChange={e => setCompanyInfo({...companyInfo, name: e.target.value})} />
+              <textarea className="text-sm text-slate-600 w-full outline-none resize-none" rows={2} value={companyInfo.address} onChange={e => setCompanyInfo({...companyInfo, address: e.target.value})} />
+              <div className="text-xs font-semibold text-slate-500">Tax ID: {companyInfo.taxId} | Tel: {companyInfo.phone}</div>
+            </div>
+          </div>
+          <div className="bg-slate-900 text-white px-6 py-2 rounded-l-full -mr-10 print:mr-0 print:bg-white print:text-black print:border">
+            <h3 className="font-bold">ใบเสนอราคา / Quotation</h3>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 border border-slate-900 mb-6">
+          <div className="border-r border-slate-900 p-4 space-y-2 bg-slate-50/30">
+            <div className="flex"><span className="w-16 font-bold text-sm">ลูกค้า:</span> 
+              <input className="flex-1 font-bold outline-none bg-transparent text-sm" value={clientInfo.name} onChange={e => setClientInfo({...clientInfo, name: e.target.value})} />
+            </div>
+            <textarea className="w-full text-xs outline-none bg-transparent resize-none" rows={2} value={clientInfo.address} onChange={e => setClientInfo({...clientInfo, address: e.target.value})} />
+            <div className="flex items-center gap-4 text-xs border-t pt-2 mt-2">
+              <span className="font-bold">Tax ID:</span>
+              <input className="w-24 border-b outline-none bg-transparent" value={clientInfo.taxId} onChange={e => setClientInfo({...clientInfo, taxId: e.target.value})} />
+              <button onClick={() => setClientInfo({...clientInfo, isHeadOffice: !clientInfo.isHeadOffice})} className="flex items-center gap-1">
+                {clientInfo.isHeadOffice ? <CheckSquare size={14} /> : <Square size={14} />} <span>สำนักงานใหญ่</span>
+              </button>
+            </div>
+          </div>
+          <div className="p-4 space-y-1 text-xs">
+            <div className="flex justify-between border-b pb-1"><span>เลขที่ใบเสนอราคา</span><input className="text-right font-bold outline-none" value={metaInfo.quoteNumber} onChange={e => setMetaInfo({...metaInfo, quoteNumber: e.target.value})} /></div>
+            <div className="flex justify-between border-b pb-1"><span>วันที่ / Date</span><input type="date" className="text-right outline-none" value={metaInfo.date} onChange={e => setMetaInfo({...metaInfo, date: e.target.value})} /></div>
+            <div className="flex justify-between border-b pb-1"><span>ยืนราคา (วัน)</span><input type="number" className="text-right outline-none w-10" value={metaInfo.validDays} onChange={e => setMetaInfo({...metaInfo, validDays: parseInt(e.target.value) || 0})} /></div>
+          </div>
+        </div>
+
+        <table className="w-full border-collapse border border-slate-900 text-sm">
+          <thead>
+            <tr className="bg-slate-900 text-white">
+              <th className="py-2 w-12 border-r border-slate-700">ลำดับ</th>
+              <th className="py-2 px-4 text-left border-r border-slate-700">รายการ / Description</th>
+              <th className="py-2 w-16 text-center border-r border-slate-700">จำนวน</th>
+              <th className="py-2 w-24 text-right px-2 border-r border-slate-700">ราคา/หน่วย</th>
+              <th className="py-2 w-28 text-right px-2">จำนวนเงิน</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item, idx) => (
+              <tr key={item.id} className="border-b border-slate-100 group">
+                <td className="py-2 text-center border-r border-slate-100">{idx + 1}</td>
+                <td className="py-2 px-4 border-r border-slate-100">
+                  <textarea className="w-full bg-transparent outline-none resize-none" rows={1} value={item.description} onChange={e => handleItemChange(item.id, 'description', e.target.value)} />
+                </td>
+                <td className="py-2 text-center border-r border-slate-100">
+                  <input className="w-10 text-center outline-none bg-transparent" type="number" value={item.quantity} onChange={e => handleItemChange(item.id, 'quantity', parseFloat(e.target.value) || 0)} />
+                </td>
+                <td className="py-2 text-right px-2 border-r border-slate-100">
+                  <input className="w-full text-right outline-none bg-transparent" type="number" value={item.unitPrice} onChange={e => handleItemChange(item.id, 'unitPrice', parseFloat(e.target.value) || 0)} />
+                </td>
+                <td className="py-2 text-right px-2 font-bold relative">
+                  {(item.quantity * item.unitPrice).toLocaleString(undefined, {minimumFractionDigits: 2})}
+                  <button onClick={() => handleRemoveItem(item.id)} className="absolute -right-6 top-2 text-red-300 hover:text-red-500 opacity-0 group-hover:opacity-100 print:hidden"><X size={14} /></button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <button onClick={handleAddItem} className="w-full py-2 bg-slate-50 text-slate-400 hover:text-blue-600 border-t border-slate-100 print:hidden flex items-center justify-center gap-2 text-xs"><PlusCircle size={14} /> เพิ่มรายการ</button>
+
+        <div className="flex border border-slate-900 mt-6 overflow-hidden">
+          <div className="flex-1 p-4 bg-slate-50/50">
+            <textarea className="w-full bg-transparent text-xs text-slate-500 outline-none resize-none h-16" placeholder="หมายเหตุ..." />
+            <div className="bg-blue-900 text-white p-2 text-center text-xs font-bold rounded mt-2 print:text-black print:bg-white print:border">{thaiBahtText(totals.grandTotal)}</div>
+          </div>
+          <div className="w-64">
+            <div className="p-2 border-b flex justify-between text-xs"><span>รวมเงิน</span><span>{totals.subtotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+            <div className="p-2 border-b flex justify-between text-xs"><span>VAT ({vatRate}%)</span><input className="w-8 text-right bg-transparent outline-none" value={vatRate} onChange={e => setVatRate(parseFloat(e.target.value) || 0)} /><span>{totals.vatAmount.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+            <div className="p-3 bg-blue-900 text-white flex justify-between font-bold print:text-black print:bg-white print:border-t-2"><span>ยอดสุทธิ</span><span>{totals.grandTotal.toLocaleString(undefined, {minimumFractionDigits: 2})}</span></div>
+          </div>
+        </div>
+      </div>
+
+      {isHistoryOpen && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex justify-end">
+          <div className="w-80 bg-white h-full shadow-2xl p-6 overflow-y-auto">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="font-bold flex items-center gap-2"><History size={20} /> ประวัติ</h2>
+              <button onClick={() => setIsHistoryOpen(false)}><X /></button>
+            </div>
+            {isLoadingHistory ? <Loader2 className="animate-spin mx-auto mt-10" /> : 
+              savedQuotes.map(q => (
+                <div key={q.id} className="border p-3 rounded-lg mb-2 hover:border-blue-500 cursor-pointer relative group" onClick={() => {
+                  setClientInfo(q.clientInfo); setItems(q.items); setVatRate(q.vatRate); setIsHistoryOpen(false);
+                }}>
+                  <div className="text-xs font-bold text-blue-600">{q.metaInfo.quoteNumber}</div>
+                  <div className="text-sm font-bold truncate">{q.clientInfo.name || 'ไม่ระบุชื่อ'}</div>
+                  <div className="text-xs text-right mt-1">฿{q.totals.grandTotal.toLocaleString()}</div>
+                  <button onClick={async (e) => { e.stopPropagation(); await deleteDoc(doc(db, 'artifacts', appId, 'users', user?.uid || '', 'quotations', q.id)); }} className="absolute -left-2 -top-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100"><X size={10} /></button>
+                </div>
+              ))
+            }
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
